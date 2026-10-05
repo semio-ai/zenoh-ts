@@ -128,9 +128,7 @@ impl ClientCertificateIssuer {
             private_key_pem: Zeroizing::new(key.serialize_pem()),
         })
     }
-}
 
-impl ClientCertificateIssuer {
     /// Issues a certificate and verifies it as a router does, with `signing_certificate` as
     /// trust anchor, so that a CA whose certificates cannot verify fails at start rather than
     /// on every connection. rcgen rebuilds the issuer name from its parsed attributes, and
