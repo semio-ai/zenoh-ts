@@ -29,7 +29,7 @@ With the plugin's `authentication` section set:
   refused with HTTP 401 before any session is created.
 - The ticket's **principal** is `principal_prefix` followed by `sub`. It must be
   a single key-expression chunk: it may not be empty or contain `/`, `*`, `$`,
-  `#` or `?`.
+  `#` or `?`. It may not contain control characters either.
 - Once upgraded, the WebSocket gets its **own client session** to the router,
   over the TLS endpoint `client_session.connect`. The plugin mints a client
   certificate for it (see below), so the router authenticates the session as
@@ -40,6 +40,9 @@ With the plugin's `authentication` section set:
 - The plugin never logs the ticket, private keys or certificates. It logs each
   admission with the client's address, the principal and the ticket's `jti`,
   and each refusal with the client's address and the check that failed.
+  Zenoh itself logs a TLS connector's settings, its private key included, when
+  it cannot build the connector from them; the plugin checks at start the
+  inputs of that build it does not generate itself (see below).
 
 Without `authentication`, the plugin behaves as upstream's.
 
@@ -60,10 +63,38 @@ The session presents the client certificate followed by every certificate in
 `client_session.signing_certificate`. The signing certificate may be an
 intermediate CA: the router's own `root_ca_certificate` must anchor the chain.
 
-At start, the plugin checks that the signing certificate is a CA allowed to
-sign certificates, is currently valid, and matches the signing key, and that
-the ticket keys are EC P-256 public keys. Any configuration error stops the
-plugin from starting.
+At start, the plugin checks:
+
+- that each ticket key is a valid EC P-256 public key, and that `leeway_secs`
+  is at most 300;
+- that `connect` is a bare `tls/<host>:<port>`, without metadata or endpoint
+  configuration, and that every certificate in `root_ca_certificate` is usable
+  as a trust anchor;
+- that the signing certificate is a currently valid CA allowed to sign
+  certificates, whose extended key usage, if restricted, includes
+  `clientAuth`, and that it matches the signing key;
+- that a certificate it issues verifies against the signing certificate, which
+  fails for a CA whose subject repeats an attribute type (such as two `DC`s):
+  the certificates it would issue could not name it as their issuer.
+
+Any of these errors stops the plugin from starting.
+
+#### What bounds a session
+
+- A ticket is accepted any number of times until it expires: keep its lifetime
+  short. It travels in the URL, which proxies in front of the plugin may log.
+- The session lasts as long as the server side of the WebSocket. The plugin
+  sends no WebSocket pings and has no idle timeout, so a client that vanishes
+  without closing its connection keeps its session until writing to it fails,
+  which never happens if nothing is sent to it.
+- Neither the ticket's `exp` nor the certificate's expiry ends a live session.
+  If the router drops the link, Zenoh's client session tries to reconnect with
+  the same certificate, which fails once that certificate has expired; the
+  WebSocket then stays open on a session that reaches nothing.
+- Zenoh's TLS connector trusts the public Web PKI roots as well as
+  `root_ca_certificate`. With `verify_name_on_connect: true` and a loopback
+  `connect` address, as in the example below, no public certificate can stand
+  in for the router's.
 
 ## Configuration
 
@@ -74,10 +105,10 @@ The `authentication` section of `plugins/remote_api`:
 | `ticket.public_keys` | required | Ticket verification keys, SPKI PEM (`-----BEGIN PUBLIC KEY-----`), EC P-256. A ticket verified by any of them passes, which allows key rotation. |
 | `ticket.issuer` | required | The only accepted `iss`. |
 | `ticket.audience` | required | The only accepted `aud`. |
-| `ticket.principal_prefix` | required | Prepended to `sub` to form the principal. May be empty. |
-| `ticket.leeway_secs` | `30` | Clock skew tolerated on `exp`, `nbf` and `iat`. |
-| `client_session.connect` | required | The router's `tls/` endpoint for these sessions. |
-| `client_session.root_ca_certificate` | required | Path to the PEM trust anchors for the router's certificate. |
+| `ticket.principal_prefix` | required | Prepended to `sub` to form the principal. May be empty, which lets a subject name any certificate Common Name the router's rules know, devices' included. |
+| `ticket.leeway_secs` | `30` | Clock skew tolerated on `exp`, `nbf` and `iat`; at most 300. |
+| `client_session.connect` | required | The router's `tls/<host>:<port>` endpoint for these sessions. |
+| `client_session.root_ca_certificate` | required | Path to the PEM trust anchors for the router's certificate (on top of the public Web PKI roots). |
 | `client_session.signing_certificate` | required | Path to the PEM certificate of the CA that signs client certificates, optionally followed by its intermediates. |
 | `client_session.signing_private_key` | required | Path to that CA's private key, unencrypted PKCS#8 PEM (`-----BEGIN PRIVATE KEY-----`). Convert a SEC1 key with `openssl pkcs8 -topk8 -nocrypt`. |
 | `client_session.certificate_validity_secs` | `86400` | Lifetime of each client certificate. |
@@ -163,11 +194,12 @@ to the router over TLS.
 Pass the locator as a full URL so that the query string reaches the plugin:
 
 ```ts
-const session = await Session.open(new Config(`ws://bridge.example:8080/?ticket=${ticket}`));
+const session = await Session.open(new Config(`wss://bridge.example/?ticket=${ticket}`));
 ```
 
 The shorthand `ws/host:port` keeps only `host:port` and drops anything after
-it. When the upgrade is refused, `Session.open` retries the WebSocket ten times,
+it. zenoh-ts logs the URL it connects to, ticket included, with
+`console.warn`. When the upgrade is refused, `Session.open` retries the WebSocket ten times,
 waiting 2 s, then twice as long each time, before it fails; a client that needs
 to notice a refused ticket sooner bounds it with its own timeout.
 
