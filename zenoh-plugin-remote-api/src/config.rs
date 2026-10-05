@@ -34,6 +34,11 @@ pub struct Config {
 
     pub secure_websocket: Option<SecureWebsocket>,
 
+    /// When present, every WebSocket client must present a ticket, and gets its own client
+    /// session to the router, authenticated as the ticket's principal. When absent, every
+    /// client gets a session on the router's own runtime, which no access control sees.
+    pub authentication: Option<Authentication>,
+
     #[serde(default, deserialize_with = "deserialize_path")]
     __path__: Option<Vec<String>>,
     __required__: Option<bool>,
@@ -45,6 +50,72 @@ pub struct Config {
 pub struct SecureWebsocket {
     pub certificate_path: String,
     pub private_key_path: String,
+}
+
+#[derive(JsonSchema, Deserialize, serde::Serialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct Authentication {
+    pub ticket: TicketConfig,
+    pub client_session: ClientSessionConfig,
+}
+
+/// How the `ticket` query parameter of a WebSocket upgrade request is verified. A ticket is a
+/// compact JWT signed with ES256 that carries `iss`, `aud`, `sub`, `iat`, `exp` and `jti`.
+#[derive(JsonSchema, Deserialize, serde::Serialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct TicketConfig {
+    /// EC P-256 public keys as SPKI PEM (`-----BEGIN PUBLIC KEY-----`). A ticket is accepted
+    /// when any of them verifies its signature, so a new key can be added before the old one
+    /// is retired.
+    pub public_keys: Vec<String>,
+    /// The only accepted `iss` claim.
+    pub issuer: String,
+    /// The only accepted `aud` claim.
+    pub audience: String,
+    /// Prepended to the `sub` claim to form the principal: the Common Name of the client
+    /// certificate, which the router's access control matches.
+    pub principal_prefix: String,
+    /// Clock skew tolerated on `exp`, `iat` and `nbf`, at most 300.
+    #[serde(default = "default_leeway_secs")]
+    pub leeway_secs: u64,
+}
+
+/// The client session opened to the router for each authenticated WebSocket.
+#[derive(JsonSchema, Deserialize, serde::Serialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct ClientSessionConfig {
+    /// The router's TLS endpoint for these sessions, e.g. `tls/127.0.0.1:7448`, without
+    /// metadata or configuration. The router authenticates the principal only if this
+    /// listener requires client certificates.
+    pub connect: String,
+    /// Path to the PEM trust anchors for the router's certificate. Zenoh's TLS connector
+    /// trusts the public Web PKI roots as well.
+    pub root_ca_certificate: String,
+    /// Path to the PEM certificate of the CA that signs the client certificates, optionally
+    /// followed by the intermediates between it and the router's trust anchor. Every
+    /// certificate in the file is sent after the client certificate.
+    pub signing_certificate: String,
+    /// Path to the signing CA's private key, as unencrypted PKCS#8 PEM
+    /// (`-----BEGIN PRIVATE KEY-----`).
+    pub signing_private_key: String,
+    /// Lifetime of each client certificate.
+    #[serde(default = "default_certificate_validity_secs")]
+    pub certificate_validity_secs: u64,
+    /// Whether the router's certificate must name the host in `connect`.
+    #[serde(default = "default_verify_name_on_connect")]
+    pub verify_name_on_connect: bool,
+}
+
+fn default_leeway_secs() -> u64 {
+    30
+}
+
+fn default_certificate_validity_secs() -> u64 {
+    86400
+}
+
+fn default_verify_name_on_connect() -> bool {
+    true
 }
 
 impl From<&Config> for serde_json::Value {
@@ -259,5 +330,96 @@ mod tests {
         );
         assert_eq!(__path__, None);
         assert_eq!(__required__, None);
+    }
+
+    const AUTHENTICATION: &str = r#"{
+        "websocket_port": "127.0.0.1:8080",
+        "authentication": {
+            "ticket": {
+                "public_keys": ["-----BEGIN PUBLIC KEY-----\nA\n-----END PUBLIC KEY-----\n"],
+                "issuer": "semio-studio",
+                "audience": "semio-bridge",
+                "principal_prefix": "u:",
+                "leeway_secs": 30
+            },
+            "client_session": {
+                "connect": "tls/127.0.0.1:7448",
+                "root_ca_certificate": "/certs/ca.pem",
+                "signing_certificate": "/certs/gateway-ca.pem",
+                "signing_private_key": "/certs/gateway-ca.key",
+                "certificate_validity_secs": 86400,
+                "verify_name_on_connect": true
+            }
+        }
+    }"#;
+
+    #[test]
+    fn authentication_is_absent_by_default() {
+        let config = serde_json::from_str::<Config>(r#"{"websocket_port": 8080}"#).unwrap();
+        assert!(config.authentication.is_none());
+    }
+
+    #[test]
+    fn authentication_fields() {
+        let config = serde_json::from_str::<Config>(AUTHENTICATION).unwrap();
+        let authentication = config.authentication.unwrap();
+        let ticket = authentication.ticket;
+        assert_eq!(ticket.public_keys.len(), 1);
+        assert_eq!(ticket.issuer, "semio-studio");
+        assert_eq!(ticket.audience, "semio-bridge");
+        assert_eq!(ticket.principal_prefix, "u:");
+        assert_eq!(ticket.leeway_secs, 30);
+        let session = authentication.client_session;
+        assert_eq!(session.connect, "tls/127.0.0.1:7448");
+        assert_eq!(session.root_ca_certificate, "/certs/ca.pem");
+        assert_eq!(session.signing_certificate, "/certs/gateway-ca.pem");
+        assert_eq!(session.signing_private_key, "/certs/gateway-ca.key");
+        assert_eq!(session.certificate_validity_secs, 86400);
+        assert!(session.verify_name_on_connect);
+    }
+
+    #[test]
+    fn authentication_defaults() {
+        let mut config: serde_json::Value = serde_json::from_str(AUTHENTICATION).unwrap();
+        let authentication = &mut config["authentication"];
+        authentication["ticket"]
+            .as_object_mut()
+            .unwrap()
+            .remove("leeway_secs");
+        let session = authentication["client_session"].as_object_mut().unwrap();
+        session.remove("certificate_validity_secs");
+        session.remove("verify_name_on_connect");
+        let authentication = serde_json::from_value::<Config>(config)
+            .unwrap()
+            .authentication
+            .unwrap();
+        assert_eq!(authentication.ticket.leeway_secs, 30);
+        assert_eq!(
+            authentication.client_session.certificate_validity_secs,
+            86400
+        );
+        assert!(authentication.client_session.verify_name_on_connect);
+    }
+
+    #[test]
+    fn authentication_requires_both_ticket_and_client_session() {
+        for part in ["ticket", "client_session"] {
+            let mut config: serde_json::Value = serde_json::from_str(AUTHENTICATION).unwrap();
+            config["authentication"]
+                .as_object_mut()
+                .unwrap()
+                .remove(part);
+            assert!(
+                serde_json::from_value::<Config>(config).is_err(),
+                "authentication without {part}"
+            );
+        }
+    }
+
+    #[test]
+    fn authentication_rejects_unknown_fields() {
+        let mut config: serde_json::Value = serde_json::from_str(AUTHENTICATION).unwrap();
+        config["authentication"]["ticket"]["kid"] = "x".into();
+        assert!(serde_json::from_value::<Config>(config).is_err());
     }
 }

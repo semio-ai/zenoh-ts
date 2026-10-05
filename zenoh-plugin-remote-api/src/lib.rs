@@ -65,7 +65,9 @@ use zenoh_plugin_trait::{plugin_long_version, plugin_version, Plugin, PluginCont
 use zenoh_result::{bail, zerror, ZResult};
 use zenoh_util::ffi::JsonKeyValueMap;
 
+mod authentication;
 mod config;
+use authentication::Authenticator;
 pub use config::Config;
 
 use crate::interface::{LivelinessTokenId, PublisherId, QuerierId, QueryableId, SubscriberId};
@@ -186,7 +188,20 @@ impl Plugin for RemoteApiPlugin {
                 None => None,
             };
 
-        spawn_runtime(run(runtime.clone(), conf, wss_config));
+        let authenticator = conf
+            .authentication
+            .as_ref()
+            .map(Authenticator::new)
+            .transpose()
+            .map_err(|e| {
+                zerror!(
+                    "Plugin `{}` authentication configuration error: {}",
+                    name,
+                    e
+                )
+            })?;
+
+        spawn_runtime(serve(runtime.clone(), conf, wss_config, authenticator));
         Ok(Box::new(RunningPlugin(RemoteAPIPlugin)))
     }
 }
@@ -196,12 +211,30 @@ pub async fn run(
     config: Config,
     opt_certs: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
 ) {
+    let authenticator = match config.authentication.as_ref().map(Authenticator::new) {
+        None => None,
+        Some(Ok(authenticator)) => Some(authenticator),
+        Some(Err(e)) => {
+            tracing::error!("Authentication configuration error: {e}");
+            return;
+        }
+    };
+    serve(runtime, config, opt_certs, authenticator).await;
+}
+
+async fn serve(
+    runtime: DynamicRuntime,
+    config: Config,
+    opt_certs: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
+    authenticator: Option<Authenticator>,
+) {
     let state_map = Arc::new(RwLock::new(HashMap::new()));
 
     // Return WebServer And State
     let remote_api_runtime = RemoteAPIRuntime {
         config: Arc::new(config),
         wss_certs: opt_certs,
+        authenticator: authenticator.map(Arc::new),
         zenoh_runtime: runtime,
         state_map,
     };
@@ -212,6 +245,7 @@ pub async fn run(
 struct RemoteAPIRuntime {
     config: Arc<Config>,
     wss_certs: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
+    authenticator: Option<Arc<Authenticator>>,
     zenoh_runtime: DynamicRuntime,
     state_map: StateMap,
 }
@@ -223,6 +257,7 @@ impl RemoteAPIRuntime {
             self.zenoh_runtime.clone(),
             self.state_map.clone(),
             self.wss_certs,
+            self.authenticator,
         );
 
         let config = (*self.config).clone();
@@ -473,6 +508,15 @@ impl RunningPluginTrait for RunningPlugin {
 
 type StateMap = Arc<RwLock<HashMap<String, Arc<Mutex<AdminSpaceClient>>>>>;
 
+/// Where a WebSocket client's session comes from.
+enum SessionSource {
+    /// A session on the router's own runtime, opened before the handshake.
+    Runtime(zenoh::Session),
+    /// A client session to the router as the principal the upgrade request's ticket names,
+    /// opened after the handshake.
+    Authenticated(Arc<Authenticator>),
+}
+
 pub trait Streamable:
     tokio::io::AsyncRead + tokio::io::AsyncWrite + std::marker::Send + Unpin
 {
@@ -486,6 +530,7 @@ async fn run_websocket_server(
     zenoh_runtime: DynamicRuntime,
     state_map: StateMap,
     opt_certs: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
+    authenticator: Option<Arc<Authenticator>>,
 ) {
     let mut opt_tls_acceptor: Option<TlsAcceptor> = None;
 
@@ -510,16 +555,20 @@ async fn run_websocket_server(
         let zenoh_runtime = zenoh_runtime.clone();
         let opt_tls_acceptor = opt_tls_acceptor.clone();
         let state_map2 = state_map.clone();
+        let authenticator = authenticator.clone();
         let new_websocket = async move {
             let sock_adress = Arc::new(sock_addr);
             let (ws_ch_tx, ws_ch_rx) = flume::unbounded::<(OutRemoteMessage, Option<SequenceId>)>();
 
-            let session = match zenoh::session::init(zenoh_runtime.clone()).await {
-                Ok(session) => session,
-                Err(err) => {
-                    tracing::error!("Unable to get Zenoh session from Runtime {err}");
-                    return;
-                }
+            let session_source = match authenticator {
+                None => match zenoh::session::init(zenoh_runtime.clone()).await {
+                    Ok(session) => SessionSource::Runtime(session),
+                    Err(err) => {
+                        tracing::error!("Unable to get Zenoh session from Runtime {err}");
+                        return;
+                    }
+                },
+                Some(authenticator) => SessionSource::Authenticated(authenticator),
             };
             let id = Uuid::new_v4();
             tracing::debug!("Client {sock_addr:?} -> {id}");
@@ -535,11 +584,21 @@ async fn run_websocket_server(
                 None => Box::new(tcp_stream),
             };
 
-            let ws_stream = match tokio_tungstenite::accept_async(streamable).await {
-                Ok(ws_stream) => ws_stream,
-                Err(e) => {
-                    tracing::error!("Error during the websocket handshake occurred: {}", e);
-                    return;
+            let (ws_stream, session) = match session_source {
+                SessionSource::Runtime(session) => {
+                    match tokio_tungstenite::accept_async(streamable).await {
+                        Ok(ws_stream) => (ws_stream, session),
+                        Err(e) => {
+                            tracing::error!("Error during the websocket handshake occurred: {}", e);
+                            return;
+                        }
+                    }
+                }
+                SessionSource::Authenticated(authenticator) => {
+                    match authenticator.accept(streamable, sock_addr).await {
+                        Some(accepted) => accepted,
+                        None => return,
+                    }
                 }
             };
 
