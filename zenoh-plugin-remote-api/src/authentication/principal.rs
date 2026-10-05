@@ -19,19 +19,20 @@ const FORBIDDEN: [char; 5] = ['/', '*', '$', '#', '?'];
 /// which the router's access control matches.
 ///
 /// It is a valid single key-expression chunk, so that rules and key expressions can embed
-/// it as one segment without it matching or spanning anything else.
+/// it as one segment without it matching or spanning anything else. It holds no control
+/// characters either, which have no place in a certificate name and would forge log lines.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Principal(String);
 
 impl Principal {
     /// The principal `prefix` + `subject`, or `None` when the subject is empty or the result
-    /// is not a single key-expression chunk.
+    /// is not a single key-expression chunk or holds a control character.
     pub(crate) fn new(prefix: &str, subject: &str) -> Option<Self> {
         if subject.is_empty() {
             return None;
         }
         let principal = format!("{prefix}{subject}");
-        is_chunk(&principal).then_some(Principal(principal))
+        is_valid(&principal).then_some(Principal(principal))
     }
 
     pub(crate) fn as_str(&self) -> &str {
@@ -45,14 +46,18 @@ impl fmt::Display for Principal {
     }
 }
 
-/// Whether `prefix` can start a principal: it contains none of the characters a
-/// key-expression chunk forbids. It may be empty.
+/// Whether `prefix` can start a principal: it holds none of the characters a principal
+/// forbids. It may be empty.
 pub(crate) fn is_valid_prefix(prefix: &str) -> bool {
-    !prefix.contains(FORBIDDEN)
+    !prefix.contains(is_forbidden)
 }
 
-fn is_chunk(s: &str) -> bool {
-    !s.is_empty() && !s.contains(FORBIDDEN)
+fn is_valid(principal: &str) -> bool {
+    !principal.is_empty() && !principal.contains(is_forbidden)
+}
+
+fn is_forbidden(c: char) -> bool {
+    FORBIDDEN.contains(&c) || c.is_control()
 }
 
 #[cfg(test)]
@@ -77,7 +82,10 @@ mod tests {
 
     #[test]
     fn subject_with_a_forbidden_character_is_refused() {
-        for subject in ["a/b", "*", "**", "a*", "$*", "a$b", "a#b", "a?b", "/"] {
+        for subject in [
+            "a/b", "*", "**", "a*", "$*", "a$b", "a#b", "a?b", "/", "a\nb", "a\rb", "\u{7f}",
+            "\u{85}",
+        ] {
             assert_eq!(Principal::new("u:", subject), None, "{subject:?}");
         }
     }
@@ -94,6 +102,7 @@ mod tests {
         assert!(is_valid_prefix("u:"));
         assert!(!is_valid_prefix("u/"));
         assert!(!is_valid_prefix("u*"));
+        assert!(!is_valid_prefix("u\n"));
         assert_eq!(Principal::new("", "alice").unwrap().as_str(), "alice");
     }
 }

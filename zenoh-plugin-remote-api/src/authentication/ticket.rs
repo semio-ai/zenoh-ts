@@ -14,7 +14,8 @@
 use std::fmt;
 
 use jsonwebtoken::{
-    decode, errors::ErrorKind, get_current_timestamp, Algorithm, DecodingKey, Validation,
+    crypto::rust_crypto::DEFAULT_PROVIDER, decode, errors::ErrorKind, get_current_timestamp,
+    Algorithm, DecodingKey, Validation,
 };
 use rcgen::{PublicKeyData, SubjectPublicKeyInfo, PKCS_ECDSA_P256_SHA256};
 use serde::Deserialize;
@@ -22,6 +23,10 @@ use zenoh_result::{bail, zerror, ZResult};
 
 use super::principal::{is_valid_prefix, Principal};
 use crate::config::TicketConfig;
+
+/// The largest clock skew tolerated. Anything beyond it is a misconfiguration, and the
+/// arithmetic on timestamps stays far from overflow.
+const MAX_LEEWAY_SECS: u64 = 300;
 
 /// Verifies tickets against the configured keys and claims.
 pub(crate) struct TicketVerifier {
@@ -95,8 +100,11 @@ impl TicketVerifier {
         if config.audience.is_empty() {
             bail!("`ticket.audience` is empty");
         }
+        if config.leeway_secs > MAX_LEEWAY_SECS {
+            bail!("`ticket.leeway_secs` exceeds {MAX_LEEWAY_SECS}");
+        }
         if !is_valid_prefix(&config.principal_prefix) {
-            bail!("`ticket.principal_prefix` contains a character forbidden in a key-expression chunk (/ * $ # ?)");
+            bail!("`ticket.principal_prefix` contains a control character or one forbidden in a key-expression chunk (/ * $ # ?)");
         }
 
         let mut validation = Validation::new(Algorithm::ES256);
@@ -166,8 +174,12 @@ fn decoding_key(pem: &str) -> ZResult<DecodingKey> {
     if spki.algorithm() != &PKCS_ECDSA_P256_SHA256 {
         bail!("not an EC P-256 public key, which ES256 requires");
     }
-    DecodingKey::from_ec_pem(pem.as_bytes())
-        .map_err(|_| zerror!("not usable as an ES256 verification key").into())
+    let key = DecodingKey::from_ec_pem(pem.as_bytes())
+        .map_err(|_| zerror!("not usable as an ES256 verification key"))?;
+    // Building the verifier that `decode` builds checks that the point is on the curve.
+    (DEFAULT_PROVIDER.verifier_factory)(&Algorithm::ES256, &key)
+        .map_err(|_| zerror!("not a valid EC P-256 public key"))?;
+    Ok(key)
 }
 
 #[cfg(test)]
@@ -465,6 +477,23 @@ pub(crate) mod tests {
         let mut audience = config(vec![key.public_pem()]);
         audience.audience.clear();
         assert!(TicketVerifier::new(&audience).is_err());
+        let mut leeway = config(vec![key.public_pem()]);
+        leeway.leeway_secs = MAX_LEEWAY_SECS + 1;
+        assert!(TicketVerifier::new(&leeway).is_err());
+    }
+
+    #[test]
+    fn key_whose_point_is_off_the_curve_is_refused() {
+        let key = SigningKey::generate();
+        let mut spki = pem::parse(key.public_pem()).unwrap().into_contents();
+        // The last byte belongs to the point's y coordinate.
+        *spki.last_mut().unwrap() ^= 1;
+        let off_curve = pem::encode(&pem::Pem::new("PUBLIC KEY", spki));
+        let error = TicketVerifier::new(&config(vec![off_curve, key.public_pem()]))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("public_keys[0]"), "{error}");
     }
 
     #[test]

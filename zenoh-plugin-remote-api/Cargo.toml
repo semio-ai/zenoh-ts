@@ -68,6 +68,7 @@ lru = { workspace = true }
 jsonwebtoken = { workspace = true }
 pem = { workspace = true }
 rcgen = { workspace = true }
+rustls = { workspace = true }
 time = { workspace = true }
 x509-parser = { workspace = true }
 zeroize = { workspace = true }

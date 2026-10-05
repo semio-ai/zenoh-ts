@@ -19,7 +19,10 @@
 use std::{
     net::TcpListener,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -475,7 +478,19 @@ async fn upgrade_requires_a_valid_ticket_and_the_session_is_subject_to_the_acl()
     )
     .await;
 
-    // Refused before any session exists.
+    // Refused before any session exists: the router sees no transport open, even briefly.
+    let transports_opened = Arc::new(AtomicUsize::new(0));
+    let counter = transports_opened.clone();
+    router
+        .observer
+        .info()
+        .transport_events_listener()
+        .callback(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        })
+        .background()
+        .await
+        .unwrap();
     assert_eq!(
         status_of(Client::connect(&router.url(None)).await),
         StatusCode::UNAUTHORIZED
@@ -492,7 +507,8 @@ async fn upgrade_requires_a_valid_ticket_and_the_session_is_subject_to_the_acl()
             StatusCode::UNAUTHORIZED
         );
     }
-    assert!(router.authenticated_links().await.is_empty());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(transports_opened.load(Ordering::SeqCst), 0);
 
     // Admitted, and seen by the router as u:alice.
     let mut alice = Client::connect(&router.url(Some(&fixture.ticket("alice"))))
@@ -506,6 +522,10 @@ async fn upgrade_requires_a_valid_ticket_and_the_session_is_subject_to_the_acl()
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    assert!(
+        transports_opened.load(Ordering::SeqCst) > 0,
+        "the transport listener sees sessions open"
+    );
 
     // The router's access control applies: demo/alice flows both ways, demo/bob neither.
     let observed = exchange(&router, &mut alice).await.lock().unwrap().clone();

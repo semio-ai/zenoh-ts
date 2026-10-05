@@ -46,6 +46,10 @@ jsonwebtoken = { version = "11.1.0", default-features = false, features = [
     "rust_crypto",
 ] }
 pem = "3.0.5"
+rustls = { version = "0.23.31", default-features = false, features = [
+    "ring",
+    "std",
+] }
 rcgen = { version = "0.14.7", default-features = false, features = [
     "crypto",
     "pem",

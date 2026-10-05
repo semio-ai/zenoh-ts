@@ -103,8 +103,10 @@ impl Authenticator {
         };
 
         let principal = &ticket.principal;
+        // The `jti` is quoted and escaped: unlike the principal, nothing restricts its
+        // characters.
         tracing::info!(
-            "WebSocket from {remote} authenticated as {principal} (ticket {})",
+            "WebSocket from {remote} authenticated as {principal} (ticket {:?})",
             ticket.id
         );
         match self.sessions.open(principal).await {

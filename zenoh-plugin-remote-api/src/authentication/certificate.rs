@@ -11,14 +11,19 @@
 
 //! Client certificates minted for one principal each, signed by the configured CA.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
 };
+use rustls::{
+    crypto::ring::default_provider,
+    pki_types::{CertificateDer, PrivateKeyDer, UnixTime},
+    server::WebPkiClientVerifier,
+    RootCertStore,
+};
 use time::OffsetDateTime;
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use x509_parser::prelude::{FromDer, X509Certificate};
 use zenoh_result::{bail, zerror, ZResult};
 use zeroize::Zeroizing;
@@ -84,11 +89,13 @@ impl ClientCertificateIssuer {
         let issuer = Issuer::from_ca_cert_der(signing_certificate, key)
             .map_err(|_| zerror!("`signing_certificate` cannot be read as a CA certificate"))?;
 
-        Ok(ClientCertificateIssuer {
+        let issuer = ClientCertificateIssuer {
             issuer,
             chain_pem,
             validity,
-        })
+        };
+        issuer.check_issued_certificates_verify(signing_certificate)?;
+        Ok(issuer)
     }
 
     /// A fresh EC P-256 key and a certificate for it, whose Common Name is `principal`,
@@ -108,7 +115,9 @@ impl ClientCertificateIssuer {
         params.use_authority_key_identifier_extension = true;
         let now = OffsetDateTime::now_utc();
         params.not_before = now - CLOCK_SKEW_ALLOWANCE;
-        params.not_after = now + self.validity;
+        params.not_after = now
+            .checked_add(self.validity.try_into().unwrap_or(time::Duration::MAX))
+            .ok_or_else(|| zerror!("`certificate_validity_secs` reaches beyond year 9999"))?;
 
         let certificate = params
             .signed_by(&key, &self.issuer)
@@ -121,8 +130,57 @@ impl ClientCertificateIssuer {
     }
 }
 
-/// Checks that `certificate` is a CA certificate allowed to sign certificates, and that
-/// `key` is its private key.
+impl ClientCertificateIssuer {
+    /// Issues a certificate and verifies it as a router does, with `signing_certificate` as
+    /// trust anchor, so that a CA whose certificates cannot verify fails at start rather than
+    /// on every connection. rcgen rebuilds the issuer name from its parsed attributes, and
+    /// loses attribute types that the CA's subject repeats.
+    fn check_issued_certificates_verify(
+        &self,
+        signing_certificate: &CertificateDer<'_>,
+    ) -> ZResult<()> {
+        let probe =
+            Principal::new("", "probe").ok_or_else(|| zerror!("invalid probe principal"))?;
+        let identity = self.issue(&probe)?;
+        let issued = rustls_pemfile::certs(&mut identity.certificate_chain_pem.as_bytes())
+            .next()
+            .and_then(Result::ok)
+            .ok_or_else(|| zerror!("cannot read back an issued client certificate"))?;
+
+        let (_, issued_x509) = X509Certificate::from_der(&issued)
+            .map_err(|_| zerror!("cannot parse an issued client certificate"))?;
+        let (_, signing_x509) = X509Certificate::from_der(signing_certificate)
+            .map_err(|_| zerror!("`signing_certificate` is not a valid X.509 certificate"))?;
+        if issued_x509.issuer().as_raw() != signing_x509.subject().as_raw() {
+            bail!(
+                "the subject of `signing_certificate` cannot be reproduced as the issuer of \
+                 client certificates (an attribute type repeats in it)"
+            );
+        }
+
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(signing_certificate.clone().into_owned())
+            .map_err(|e| zerror!("`signing_certificate` is not usable as a trust anchor: {e}"))?;
+        let verifier = WebPkiClientVerifier::builder_with_provider(
+            Arc::new(roots),
+            Arc::new(default_provider()),
+        )
+        .build()
+        .map_err(|e| zerror!("cannot build a client certificate verifier: {e}"))?;
+        verifier
+            .verify_client_cert(&issued, &[], UnixTime::now())
+            .map_err(|e| {
+                zerror!(
+                    "a client certificate signed with `signing_certificate` does not verify: {e}"
+                )
+            })?;
+        Ok(())
+    }
+}
+
+/// Checks that `certificate` is a CA certificate allowed to sign client certificates, and
+/// that `key` is its private key.
 fn check_signing_certificate(certificate: &CertificateDer<'_>, key: &KeyPair) -> ZResult<()> {
     let (_, certificate) = X509Certificate::from_der(certificate)
         .map_err(|_| zerror!("`signing_certificate` is not a valid X.509 certificate"))?;
@@ -136,6 +194,13 @@ fn check_signing_certificate(certificate: &CertificateDer<'_>, key: &KeyPair) ->
         Ok(_) => {}
         Err(_) => bail!("`signing_certificate` has an invalid key usage extension"),
     }
+    match certificate.extended_key_usage() {
+        Ok(Some(usage)) if !usage.value.client_auth => {
+            bail!("`signing_certificate` restricts extended key usage, without clientAuth")
+        }
+        Ok(_) => {}
+        Err(_) => bail!("`signing_certificate` has an invalid extended key usage extension"),
+    }
     if !certificate.validity().is_valid() {
         bail!("`signing_certificate` is not valid now (notBefore/notAfter)");
     }
@@ -147,14 +212,8 @@ fn check_signing_certificate(certificate: &CertificateDer<'_>, key: &KeyPair) ->
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::sync::Arc;
-
-    use rcgen::{BasicConstraints, Certificate, KeyUsagePurpose, SanType};
-    use tokio_rustls::rustls::{
-        crypto::ring::default_provider, pki_types::UnixTime, server::WebPkiClientVerifier,
-        RootCertStore,
-    };
-    use x509_parser::{extensions::ParsedExtension, prelude::X509Certificate};
+    use rcgen::{BasicConstraints, Certificate, SanType};
+    use x509_parser::extensions::ParsedExtension;
 
     use super::*;
 
@@ -421,6 +480,78 @@ pub(crate) mod tests {
             .unwrap()
             .to_string();
         assert!(error.contains("PKCS#8"), "{error}");
+    }
+
+    #[test]
+    fn signing_certificate_whose_subject_repeats_an_attribute_type_is_refused() {
+        let key = KeyPair::generate().unwrap();
+        let mut params = ca_params("Gateway CA");
+        params
+            .distinguished_name
+            .push(DnType::OrganizationName, "Semio");
+        let der = params.self_signed(&key).unwrap().der().to_vec();
+        // Turn the organization attribute into a second common name. The certificate's own
+        // signature breaks, which nothing checks of a trust anchor.
+        let (organization, common_name) = ([6, 3, 85, 4, 10], [6, 3, 85, 4, 3]);
+        let mut patched = der.clone();
+        for i in 0..=patched.len() - organization.len() {
+            if patched[i..i + organization.len()] == organization {
+                patched[i..i + organization.len()].copy_from_slice(&common_name);
+            }
+        }
+        let (_, ca) = X509Certificate::from_der(&patched).unwrap();
+        assert_eq!(ca.subject().iter_common_name().count(), 2);
+
+        let ca_pem = pem::encode(&pem::Pem::new("CERTIFICATE", patched));
+        let error = ClientCertificateIssuer::new(
+            ca_pem.as_bytes(),
+            key.serialize_pem().as_bytes(),
+            Duration::from_secs(3600),
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(error.contains("repeats"), "{error}");
+    }
+
+    #[test]
+    fn signing_certificate_without_client_auth_usage_is_refused() {
+        let key = KeyPair::generate().unwrap();
+        let mut params = ca_params("Gateway CA");
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let ca = params.self_signed(&key).unwrap();
+        let error = ClientCertificateIssuer::new(
+            ca.pem().as_bytes(),
+            key.serialize_pem().as_bytes(),
+            Duration::from_secs(3600),
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(error.contains("clientAuth"), "{error}");
+
+        params.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ServerAuth,
+            ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        let ca = params.self_signed(&key).unwrap();
+        assert!(ClientCertificateIssuer::new(
+            ca.pem().as_bytes(),
+            key.serialize_pem().as_bytes(),
+            Duration::from_secs(3600),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn lifetime_beyond_what_a_certificate_can_hold_is_refused() {
+        let pki = TestPki::new();
+        assert!(ClientCertificateIssuer::new(
+            pki.intermediate.pem().as_bytes(),
+            pki.intermediate_key.serialize_pem().as_bytes(),
+            Duration::from_secs(u64::MAX),
+        )
+        .is_err());
     }
 
     #[test]

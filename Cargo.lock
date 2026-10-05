@@ -4709,6 +4709,7 @@ dependencies = [
  "pem",
  "rcgen",
  "rustc_version",
+ "rustls",
  "rustls-pemfile",
  "schemars 0.8.22",
  "serde",

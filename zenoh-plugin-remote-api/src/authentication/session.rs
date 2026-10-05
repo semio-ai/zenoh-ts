@@ -14,6 +14,7 @@
 use std::{str::FromStr, time::Duration};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
+use rustls::RootCertStore;
 use serde_json::json;
 use zenoh::{config::EndPoint, Session};
 use zenoh_result::{bail, zerror, ZResult};
@@ -36,20 +37,22 @@ pub(crate) struct ClientSessionOpener {
 
 impl ClientSessionOpener {
     /// Reads the files `config` names. Errors name the field at fault, never file contents.
+    ///
+    /// Everything Zenoh's TLS connector parses from the endpoint and the trust anchors is
+    /// checked here: when the connector fails to build its configuration, Zenoh logs the
+    /// endpoint with every TLS setting, the client's private key included.
     pub(crate) fn new(config: &ClientSessionConfig) -> ZResult<Self> {
         let endpoint = EndPoint::from_str(&config.connect)
             .map_err(|e| zerror!("`client_session.connect`: {e}"))?;
         if endpoint.protocol().as_str() != "tls" {
             bail!("`client_session.connect` must be a `tls/` endpoint, for the router to authenticate the client certificate");
         }
+        if !endpoint.metadata().as_str().is_empty() || !endpoint.config().as_str().is_empty() {
+            bail!("`client_session.connect` must be a bare `tls/<host>:<port>`, without `?` metadata or `#` configuration");
+        }
 
         let root_ca_certificate = read(&config.root_ca_certificate, "root_ca_certificate")?;
-        let has_certificate = rustls_pemfile::certs(&mut root_ca_certificate.as_slice())
-            .next()
-            .is_some_and(|c| c.is_ok());
-        if !has_certificate {
-            bail!("`client_session.root_ca_certificate` holds no PEM certificate");
-        }
+        check_trust_anchors(&root_ca_certificate)?;
 
         let signing_certificate = read(&config.signing_certificate, "signing_certificate")?;
         let signing_private_key =
@@ -76,7 +79,8 @@ impl ClientSessionOpener {
     }
 
     /// A client-mode configuration that connects to the router's endpoint only, presenting
-    /// `identity` and trusting the configured root for the router's certificate.
+    /// `identity`. Zenoh's TLS connector trusts the configured root for the router's
+    /// certificate, on top of the public Web PKI roots it always trusts.
     fn session_config(&self, identity: &ClientIdentity) -> ZResult<zenoh::Config> {
         let mut config = zenoh::Config::default();
         let mut set = |key: &str, json: &str| {
@@ -114,6 +118,24 @@ impl ClientSessionOpener {
         )?;
         Ok(config)
     }
+}
+
+/// Checks that `pem` holds certificates, all usable as trust anchors, as Zenoh's TLS
+/// connector requires.
+fn check_trust_anchors(pem: &[u8]) -> ZResult<()> {
+    let certificates = rustls_pemfile::certs(&mut &*pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| zerror!("`client_session.root_ca_certificate` is not valid PEM"))?;
+    if certificates.is_empty() {
+        bail!("`client_session.root_ca_certificate` holds no certificate");
+    }
+    let mut roots = RootCertStore::empty();
+    for (index, certificate) in certificates.into_iter().enumerate() {
+        roots.add(certificate).map_err(|e| {
+            zerror!("`client_session.root_ca_certificate`: certificate {index} is not a usable trust anchor: {e}")
+        })?;
+    }
+    Ok(())
 }
 
 fn read(path: &str, field: &str) -> ZResult<Vec<u8>> {
@@ -194,6 +216,8 @@ mod tests {
             "tcp/127.0.0.1:7448",
             "quic/127.0.0.1:7448",
             "not an endpoint",
+            "tls/127.0.0.1:7448#so_sndbuf=65000",
+            "tls/127.0.0.1:7448?prio=1-7",
         ] {
             let error = ClientSessionOpener::new(&config(connect))
                 .err()
@@ -206,5 +230,22 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(error.contains("root_ca_certificate"), "{error}");
+    }
+
+    #[test]
+    fn trust_anchors_are_checked_one_by_one() {
+        let pki = TestPki::new();
+        let root = pki.root.pem();
+        assert!(check_trust_anchors(root.as_bytes()).is_ok());
+        assert!(
+            check_trust_anchors(format!("{root}{}", pki.intermediate.pem()).as_bytes()).is_ok()
+        );
+        assert!(check_trust_anchors(b"").is_err());
+        let corrupt = pem::encode(&pem::Pem::new("CERTIFICATE", vec![0x30, 0x03, 1, 2, 3]));
+        let error = check_trust_anchors(format!("{root}{corrupt}").as_bytes())
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("certificate 1"), "{error}");
     }
 }

@@ -75,7 +75,7 @@ pub struct TicketConfig {
     /// Prepended to the `sub` claim to form the principal: the Common Name of the client
     /// certificate, which the router's access control matches.
     pub principal_prefix: String,
-    /// Clock skew tolerated on `exp`, `iat` and `nbf`.
+    /// Clock skew tolerated on `exp`, `iat` and `nbf`, at most 300.
     #[serde(default = "default_leeway_secs")]
     pub leeway_secs: u64,
 }
@@ -84,10 +84,12 @@ pub struct TicketConfig {
 #[derive(JsonSchema, Deserialize, serde::Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct ClientSessionConfig {
-    /// The router's TLS endpoint for these sessions, e.g. `tls/127.0.0.1:7448`. The router
-    /// authenticates the principal only if this listener requires client certificates.
+    /// The router's TLS endpoint for these sessions, e.g. `tls/127.0.0.1:7448`, without
+    /// metadata or configuration. The router authenticates the principal only if this
+    /// listener requires client certificates.
     pub connect: String,
-    /// Path to the PEM trust anchors for the router's certificate.
+    /// Path to the PEM trust anchors for the router's certificate. Zenoh's TLS connector
+    /// trusts the public Web PKI roots as well.
     pub root_ca_certificate: String,
     /// Path to the PEM certificate of the CA that signs the client certificates, optionally
     /// followed by the intermediates between it and the router's trust anchor. Every
