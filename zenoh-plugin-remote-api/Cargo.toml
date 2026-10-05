@@ -65,6 +65,15 @@ uuid = { workspace = true, default-features = false, features = [
 ] }
 uhlc = { workspace = true, default-features = false } # Default features are disabled due to usage in no_std crates
 lru = { workspace = true }
+jsonwebtoken = { workspace = true }
+pem = { workspace = true }
+rcgen = { workspace = true }
+time = { workspace = true }
+x509-parser = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync"] }
 
 [build-dependencies]
 rustc_version = { workspace = true }
